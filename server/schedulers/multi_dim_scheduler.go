@@ -63,9 +63,8 @@ const (
 	minHotScheduleIntervalHR = time.Second
 	maxHotScheduleIntervalHR = 20 * time.Second
 
-	balanceRatio        = 0.05
 	batchOperationLimit = 4
-	operationRetryLimit = 10
+	operationRetryLimit = 3
 	// wait for the new splitted regions to be identified as hot
 	waitSplitInfoStableInterval = 10 * time.Second
 
@@ -316,7 +315,7 @@ func (h *multiDimensionScheduler) initLoadInfo(bs *balanceSolver) {
 	for id, loadDetail := range bs.stLoadDetail {
 		hotRegions := make(map[uint64]*regionInfo)
 		for _, peer := range loadDetail.HotPeers {
-			hotRegions[peer.RegionID] = newRegionInfo(peerID, peer.RegionID, id,
+			hotRegions[peerID] = newRegionInfo(peerID, peer.RegionID, id,
 				peer.GetByteRate()/loadDetail.LoadPred.Future.ExpByteRate,
 				peer.GetKeyRate()/loadDetail.LoadPred.Future.ExpKeyRate)
 			peerID++
