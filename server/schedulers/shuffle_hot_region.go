@@ -144,7 +144,11 @@ func (s *shuffleHotRegionScheduler) runSch(typ rwType, cluster opt.Cluster) []*o
 				hotRegionThreshold,
 				write, core.RegionKind, mixed)
 			
-			s.randomHotSchedule(cluster, s.stLoadInfos[writePeer])
+			if cluster.GetOpts().GetHotSchedulerMode() % 10 > 0 {
+				s.randomHotPeer(cluster, s.stLoadInfos[writePeer])
+			} else {
+				s.revertBalance(cluster, s.stLoadInfos[writePeer])
+			}
 			s.schStatus+= 1
 		case scheduleSplit:
 			pendingOps, done := s.processPendingOps(cluster)
@@ -255,7 +259,81 @@ type loadDetailID struct {
 	expFlow float64
 }
 
-func (s *shuffleHotRegionScheduler) randomHotSchedule(cluster opt.Cluster, loadDetail map[uint64]*storeLoadDetail) {
+func (s *shuffleHotRegionScheduler) randomHotPeer(cluster opt.Cluster, loadDetail map[uint64]*storeLoadDetail) {
+	loadType := 0
+	s.regionOpRecord = make(map[uint64]*opRecord)
+
+	for storeID, detail := range loadDetail {
+		peers := detail.HotPeers
+		if len(peers) < 1 {
+			continue
+		}
+
+		sortedPeers := make([]*statistics.HotPeerStat, len(peers))
+		copy(sortedPeers, peers)
+		if loadType == 0 {
+			sort.Slice(sortedPeers, func(i, j int) bool {
+				return sortedPeers[i].GetByteRate() > sortedPeers[j].GetByteRate()
+			})
+		} else {
+			sort.Slice(sortedPeers, func(i, j int) bool {
+				return sortedPeers[i].GetKeyRate() > sortedPeers[j].GetKeyRate()
+			})
+		}
+
+		maxCount := len(sortedPeers)
+		if maxCount > 20 {
+			maxCount = 20
+		}
+		for j := 0; j < 5; j++ {
+			i := s.r.Intn(maxCount)
+			peer := sortedPeers[i]
+	
+			srcStoreID := storeID
+			// srcStore := cluster.GetStore(srcStoreID)
+			srcRegion := cluster.GetRegion(peer.RegionID)
+			if srcRegion == nil || len(srcRegion.GetDownPeers()) != 0 || len(srcRegion.GetPendingPeers()) != 0 {
+				continue
+			}
+	
+			filters := []filter.Filter{
+				filter.StoreStateFilter{ActionScope: s.GetName(), MoveRegion: true},
+				filter.NewExcludedFilter(s.GetName(), srcRegion.GetStoreIds(), srcRegion.GetStoreIds()),
+				// filter.NewPlacementSafeguard(s.GetName(), cluster, srcRegion, srcStore),
+			}
+			stores := cluster.GetStores()
+			destStoreIDs := make([]uint64, 0, len(stores))
+			for _, store := range stores {
+				if !filter.Target(cluster.GetOpts(), store, filters) {
+					continue
+				}
+				destStoreIDs = append(destStoreIDs, store.GetID())
+			}
+	
+			destStoreID := destStoreIDs[s.r.Intn(len(destStoreIDs))]
+			if destStoreID == 0 {
+				continue
+			}
+	
+			log.Info("move region info", 
+				zap.Uint64("srcStoreID", srcStoreID), 
+				zap.Uint64("dstStoreID", destStoreID),
+				zap.Uint64("regionID", peer.RegionID),
+			)
+	
+			s.regionOpRecord[peer.RegionID] = &opRecord{
+				region: &regionInfo{
+					regionID: peer.RegionID,
+					srcStoreID: srcStoreID,
+					dstStoreID: destStoreID,
+				},
+			}
+		}
+
+	}
+}
+
+func (s *shuffleHotRegionScheduler) revertBalance(cluster opt.Cluster, loadDetail map[uint64]*storeLoadDetail) {
 	loadType := 0
 	maxFlowThreshold := 30
 	
@@ -282,31 +360,77 @@ func (s *shuffleHotRegionScheduler) randomHotSchedule(cluster opt.Cluster, loadD
 		}
 	})
 
-	halfNum := uint64(len(details) / 2)
-	for i := uint64(0); i < halfNum; i++ {		
+	moveRatios := make([]float64, len(details))
+	for i := range moveRatios {
+		moveRatios[i] = float64(s.r.Intn(maxFlowThreshold) + 1) / 100.0
+	}
+	sort.Slice(moveRatios, func(i, j int) bool {
+		return moveRatios[i] > moveRatios[j]
+	})
+
+	for i := uint64(0); i < uint64(len(details) - 1); i++ {
 		peers := details[i].detail.HotPeers
 		if len(peers) < 1 {
 			continue
 		}
+
+		expByteRate := details[i].detail.LoadPred.Future.ExpByteRate
+		expKeyRate := details[i].detail.LoadPred.Future.ExpKeyRate
+
 		sortedPeers := make([]*statistics.HotPeerStat, len(peers))
 		copy(sortedPeers, peers)
 		if loadType == 0 {
 			sort.Slice(sortedPeers, func(i, j int) bool {
-				return sortedPeers[i].GetByteRate() > sortedPeers[j].GetByteRate()
+				// return sortedPeers[i].GetByteRate() > sortedPeers[j].GetByteRate()
+
+				normByteI := sortedPeers[i].GetByteRate() / expByteRate
+				normByteJ := sortedPeers[j].GetByteRate() / expByteRate
+				normKeyI := sortedPeers[i].GetKeyRate() / expKeyRate
+				normKeyJ := sortedPeers[j].GetKeyRate() / expKeyRate
+				if normByteI > normKeyI {
+					if normByteJ > normKeyJ {
+						return normByteI > normByteJ
+					} else {
+						return true
+					}
+				} else {
+					if normByteJ > normKeyJ {
+						return false
+					} else {
+						return normByteI > normByteJ
+					}
+				}
 			})
 		} else {
 			sort.Slice(sortedPeers, func(i, j int) bool {
-				return sortedPeers[i].GetKeyRate() > sortedPeers[j].GetKeyRate()
+				// return sortedPeers[i].GetKeyRate() > sortedPeers[j].GetKeyRate()
+
+				normByteI := sortedPeers[i].GetByteRate() / expByteRate
+				normByteJ := sortedPeers[j].GetByteRate() / expByteRate
+				normKeyI := sortedPeers[i].GetKeyRate() / expKeyRate
+				normKeyJ := sortedPeers[j].GetKeyRate() / expKeyRate
+				if normByteI < normKeyI {
+					if normByteJ < normKeyJ {
+						return normKeyI > normKeyJ
+					} else {
+						return true
+					}
+				} else {
+					if normByteJ < normKeyJ {
+						return false
+					} else {
+						return normKeyI > normKeyJ
+					}
+				}
 			})
 		}
 
-		moveRatio := float64(s.r.Intn(maxFlowThreshold) + 1) / 100.0
-		details[i].expFlow = (1 - moveRatio) * details[i].flow
+		details[i].expFlow = (1 - moveRatios[i]) * details[i].flow
 		log.Info("store flow info", 
 			zap.Uint64("storeID", details[i].storeID), 
 			zap.Float64("expFlow", details[i].expFlow), 
 			zap.Float64("curFlow", details[i].flow),
-			zap.Float64("ratio", moveRatio),
+			zap.Float64("ratio", moveRatios[i]),
 		)
 
 		for _, peer := range sortedPeers {
@@ -329,7 +453,8 @@ func (s *shuffleHotRegionScheduler) randomHotSchedule(cluster opt.Cluster, loadD
 				movedFlow = peer.GetKeyRate()
 			}
 
-			dstID := uint64(len(details) - 1) - i
+			randNum := s.r.Intn(len(details) - 1 - int(i))
+			dstID := uint64(randNum + int(i) + 1)
 			destStoreID := details[dstID].storeID
 			destPeer := srcRegion.GetStorePeer(destStoreID)
 			if destPeer != nil {

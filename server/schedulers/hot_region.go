@@ -83,7 +83,7 @@ const (
 	hotReadRegionMinKeyRate   = 512
 
 	loadNums = uint64(2)
-	balanceRatio = float64(0.1)
+	balanceRatioConst = float64(0.1)
 )
 
 // schedulePeerPr the probability of schedule the hot peer.
@@ -112,6 +112,8 @@ type hotScheduler struct {
 	pendingSums [resourceTypeLen]map[uint64]Influence
 	// config of hot scheduler
 	conf *hotRegionSchedulerConfig
+
+	balanceRatio float64
 }
 
 func newHotScheduler(opController *schedule.OperatorController, conf *hotRegionSchedulerConfig) *hotScheduler {
@@ -125,6 +127,7 @@ func newHotScheduler(opController *schedule.OperatorController, conf *hotRegionS
 		r:              rand.New(rand.NewSource(time.Now().UnixNano())),
 		regionPendings: make(map[uint64][2]*operator.Operator),
 		conf:           conf,
+		balanceRatio:   balanceRatioConst,
 	}
 	for ty := resourceType(0); ty < resourceTypeLen; ty++ {
 		ret.pendings[ty] = map[*pendingInfluence]struct{}{}
@@ -191,6 +194,7 @@ func (h *hotScheduler) dispatch(typ rwType, cluster opt.Cluster) []*operator.Ope
 	h.prepareForBalance(cluster)
 
 	mode := cluster.GetOpts().GetHotSchedulerMode()
+	h.balanceRatio = cluster.GetOpts().GetHotBalanceRatio()
 	if mode >= 10 {
 		return nil
 	}
@@ -669,21 +673,34 @@ func (bs *balanceSolver) solveMultiLoads() []*operator.Operator {
 	
 	pickBestDstStore := func(i uint64, region *regionInfo) *storeInfo {
 		var dstStore *storeInfo
-		filteredStores := bs.filterDstStores()
+		filters, candiStores := bs.getFilterAnadCandidateStores()
+
+		var selectedStoreIDs []uint64
+		selectedStores := make(map[uint64]*core.StoreInfo)
+		for _, store := range candiStores {
+			if filter.Target(bs.cluster.GetOpts(), store, filters) {
+				selectedStores[store.GetID()] = store
+				selectedStoreIDs = append(selectedStoreIDs, store.GetID())
+			}
+		}
+
 		minLoad := 1000.0
 		for _, store := range bs.storeInfos {
-			if _, ok := filteredStores[store.id]; !ok {
+			if _, ok := selectedStores[store.id]; !ok {
 				continue
 			}
 			afterLoad := store.loads[i] + region.loads[i]
-			if afterLoad <= 1 + balanceRatio {
+			if afterLoad <= 1 + bs.sche.balanceRatio {
 				if afterLoad < minLoad {
 					dstStore = store
 					minLoad = afterLoad
 				}
-				return store
 			}
 		}
+		log.Info("pickBestDstStore",
+			zap.Uint64("regionID", region.regionID),
+			zap.String("selectedStores", fmt.Sprintf("%+v", selectedStoreIDs)),
+		)
 		return dstStore
 	}
 
@@ -697,6 +714,13 @@ func (bs *balanceSolver) solveMultiLoads() []*operator.Operator {
 		zap.Stringer("rwTy", bs.rwTy),
 	)
 
+	for _, store := range bs.storeInfos {
+		log.Info("store load",
+			zap.Uint64("id", store.id),
+			zap.String("storeLoad", fmt.Sprintf("%+v", store.loads)),
+		)
+	}
+
 	bs.cur = &solution{}
 
 	hasFound := true
@@ -706,10 +730,16 @@ func (bs *balanceSolver) solveMultiLoads() []*operator.Operator {
 			store.classifyRegion()
 			for {
 				maxID, maxLoad := maxIDAndLoad(store)
-				if maxLoad > 1 + balanceRatio {
+				if maxLoad <= 1 + bs.sche.balanceRatio {
+					break
+				} else {
 					var selectedRegion *regionInfo
 					for {
 						if len(store.candiRegions[maxID]) == 0 {
+							log.Info("no candi region",
+								zap.Uint64("storeID", store.id),
+								zap.String("storeLoad", fmt.Sprintf("%+v", store.loads)),
+							)
 							break
 						}
 						length := len(store.candiRegions[maxID])
@@ -718,12 +748,19 @@ func (bs *balanceSolver) solveMultiLoads() []*operator.Operator {
 						
 						if _, ok := bs.sche.regionPendings[selectedRegion.regionID]; !ok {
 							break
+						} else {
+							log.Info("filter pending region",
+								zap.Uint64("storeID", store.id),
+								zap.Uint64("regionID", selectedRegion.regionID),
+								zap.String("storeLoad", fmt.Sprintf("%+v", store.loads)),
+							)
+							selectedRegion = nil
 						}
 					}
 					if selectedRegion == nil { // no suitable region
 						break
 					}
-					if maxLoad - selectedRegion.loads[maxID] >= 1 - balanceRatio {
+					if maxLoad - selectedRegion.loads[maxID] >= 1 - bs.sche.balanceRatio {
 						bs.cur.srcStoreID = store.id
 						bs.cur.srcPeerStat = selectedRegion.peerStat
 						bs.cur.region = bs.getRegion()
@@ -736,7 +773,7 @@ func (bs *balanceSolver) solveMultiLoads() []*operator.Operator {
 
 						dstStore := pickBestDstStore(maxID, selectedRegion)
 						if dstStore == nil { // there is no suitable place,  consider next region
-							log.Info("no store",
+							log.Info("no suitable store",
 								zap.Uint64("regionID", selectedRegion.regionID),
 							)
 							continue
@@ -753,7 +790,6 @@ func (bs *balanceSolver) solveMultiLoads() []*operator.Operator {
 							zap.String("dstStoreLoad", fmt.Sprintf("%+v", dstStore.loads)),
 							zap.Uint64("balanceWhichLoad", maxID),
 						)
-
 						
 						ops, infls := bs.buildOperators()
 						if ops == nil {
@@ -974,14 +1010,10 @@ func (bs *balanceSolver) getRegion() *core.RegionInfo {
 }
 
 // filterDstStores select the candidate store by filters
-func (bs *balanceSolver) filterDstStores() map[uint64]*storeLoadDetail {
-	var (
-		filters    []filter.Filter
-		candidates []*core.StoreInfo
-	)
+func (bs *balanceSolver) getFilterAnadCandidateStores() (filters []filter.Filter, candidates []*core.StoreInfo) {
 	srcStore := bs.cluster.GetStore(bs.cur.srcStoreID)
 	if srcStore == nil {
-		return nil
+		return
 	}
 
 	switch bs.opTy {
@@ -1007,8 +1039,14 @@ func (bs *balanceSolver) filterDstStores() map[uint64]*storeLoadDetail {
 		candidates = bs.cluster.GetFollowerStores(bs.cur.region)
 
 	default:
-		return nil
+		return
 	}
+	return
+}
+
+// filterDstStores select the candidate store by filters
+func (bs *balanceSolver) filterDstStores() map[uint64]*storeLoadDetail {
+	filters, candidates := bs.getFilterAnadCandidateStores()
 	return bs.pickDstStores(filters, candidates)
 }
 
